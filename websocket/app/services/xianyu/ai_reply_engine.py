@@ -652,7 +652,7 @@ class AIReplyEngine:
         self,
         settings: Dict,
         messages: List[Dict],
-        max_tokens: int = 100,
+        max_tokens: int = 256,
         temperature: float = 0.7,
     ) -> str:
         """调用Anthropic Claude官方API"""
@@ -662,6 +662,14 @@ class AIReplyEngine:
             base_url = settings.get("base_url", "")
             
             url = build_anthropic_url(base_url, "/messages")
+            
+            # 针对带 thinking/reasoner 的推理模型自动放宽 max_tokens，避免思考过程耗尽配额导致正文为空
+            lower_model = (model_name or "").lower()
+            effective_max_tokens = (
+                max(max_tokens, 2048)
+                if any(k in lower_model for k in ("thinking", "reasoner", "-r1"))
+                else max_tokens
+            )
             
             system_content = ""
             user_messages: List[Dict[str, Any]] = []
@@ -675,7 +683,7 @@ class AIReplyEngine:
             
             payload: Dict[str, Any] = {
                 "model": model_name,
-                "max_tokens": max_tokens,
+                "max_tokens": effective_max_tokens,
                 "temperature": temperature,
                 "messages": user_messages or [{"role": "user", "content": ""}],
             }
@@ -1041,14 +1049,27 @@ class AIReplyEngine:
                     settings.get("model_name"),
                 )
                 logger.info(f"【{cookie_id}】使用{provider_name} API生成回复 (provider_type={provider_type})")
-                if provider_type == "dashscope_app":
-                    reply = await self._call_dashscope_api(settings, messages)
-                elif provider_type == "gemini":
-                    reply = await self._call_gemini_api(settings, messages)
-                elif provider_type == "anthropic":
-                    reply = await self._call_anthropic_api(settings, messages)
-                else:
-                    reply = await self._call_openai_api(settings, messages)
+                max_api_retries = 3
+                for attempt in range(1, max_api_retries + 1):
+                    try:
+                        if provider_type == "dashscope_app":
+                            reply = await self._call_dashscope_api(settings, messages)
+                        elif provider_type == "gemini":
+                            reply = await self._call_gemini_api(settings, messages)
+                        elif provider_type == "anthropic":
+                            reply = await self._call_anthropic_api(settings, messages)
+                        else:
+                            reply = await self._call_openai_api(settings, messages)
+                        break
+                    except Exception as api_err:
+                        if attempt >= max_api_retries:
+                            raise
+                        retry_delay = 1.5 * attempt
+                        logger.warning(
+                            f"【{cookie_id}】{provider_name} API调用失败 (第{attempt}/{max_api_retries}次): "
+                            f"{type(api_err).__name__}: {api_err}，将在 {retry_delay:.1f}s 后重试..."
+                        )
+                        await asyncio.sleep(retry_delay)
                 
                 if reply:
                     # 二次检测：大模型返回后，若人工已介入暂停，则放弃本次回复
