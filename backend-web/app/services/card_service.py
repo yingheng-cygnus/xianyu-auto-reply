@@ -507,6 +507,13 @@ class CardService:
 
         if use_no_logistics_form and card_type != "text":
             raise ValueError("无需邮寄表单发货仅支持固定文字卡券")
+
+        # 双向同步 image_url 与 image_urls，避免前端只传 image_urls 时 image_url 为空导致下游校验失败
+        normalized_urls = [u for u in (image_urls or []) if u]
+        if not image_url and normalized_urls:
+            image_url = normalized_urls[0]
+        elif image_url and not normalized_urls:
+            normalized_urls = [image_url]
         
         card = Card(
             user_id=user_id,
@@ -517,7 +524,7 @@ class CardService:
             text_content=text_content,
             data_content=data_content,
             image_url=image_url,
-            image_urls=json.dumps(image_urls) if image_urls else None,
+            image_urls=json.dumps(normalized_urls) if normalized_urls else None,
             description=description,
             enabled=enabled,
             delay_seconds=delay_seconds,
@@ -585,7 +592,10 @@ class CardService:
                 if key == "api_config" and isinstance(value, dict):
                     value = json.dumps(value)
                 elif key == "image_urls" and isinstance(value, list):
-                    value = json.dumps(value)
+                    clean_urls = [u for u in value if u]
+                    if "image_url" not in kwargs or not kwargs.get("image_url"):
+                        card.image_url = clean_urls[0] if clean_urls else None
+                    value = json.dumps(clean_urls) if clean_urls else None
                 setattr(card, key, value)
 
         await self.session.commit()
@@ -655,6 +665,12 @@ class CardService:
         if use_no_logistics_form and card_type != "text":
             raise ValueError("无需邮寄表单发货仅支持固定文字卡券")
 
+        normalized_urls = [u for u in (image_urls or []) if u]
+        if not image_url and normalized_urls:
+            image_url = normalized_urls[0]
+        elif image_url and not normalized_urls:
+            normalized_urls = [image_url]
+
         # 1. 创建卡券（不设置 item_id，因为走关联表）
         card = Card(
             user_id=user_id,
@@ -665,7 +681,7 @@ class CardService:
             text_content=text_content,
             data_content=data_content,
             image_url=image_url,
-            image_urls=json.dumps(image_urls) if image_urls else None,
+            image_urls=json.dumps(normalized_urls) if normalized_urls else None,
             description=description,
             enabled=enabled,
             delay_seconds=delay_seconds,
@@ -762,9 +778,14 @@ class CardService:
         image_urls = None
         if card.image_urls:
             try:
-                image_urls = json.loads(card.image_urls)
+                parsed = json.loads(card.image_urls)
+                if isinstance(parsed, list):
+                    image_urls = [u for u in parsed if u]
             except json.JSONDecodeError:
                 image_urls = None
+        if not image_urls and card.image_url:
+            image_urls = [card.image_url]
+        primary_image_url = card.image_url or (image_urls[0] if image_urls else None)
 
         return {
             "id": card.id,
@@ -788,7 +809,7 @@ class CardService:
             "api_config": api_config,
             "text_content": card.text_content,
             "data_content": card.data_content,
-            "image_url": card.image_url,
+            "image_url": primary_image_url,
             "image_urls": image_urls,
             "created_at": safe_isoformat(card.created_at),
             "updated_at": safe_isoformat(card.updated_at),
@@ -836,9 +857,14 @@ class CardService:
         image_urls = None
         if card.image_urls:
             try:
-                image_urls = json.loads(card.image_urls)
+                parsed = json.loads(card.image_urls)
+                if isinstance(parsed, list):
+                    image_urls = [u for u in parsed if u]
             except json.JSONDecodeError:
                 image_urls = None
+        if not image_urls and card.image_url:
+            image_urls = [card.image_url]
+        primary_image_url = card.image_url or (image_urls[0] if image_urls else None)
 
         return {
             "id": card.id,
@@ -862,7 +888,7 @@ class CardService:
             "api_config": api_config,
             "text_content": card.text_content,
             "data_content": card.data_content,
-            "image_url": card.image_url,
+            "image_url": primary_image_url,
             "image_urls": image_urls,
             "created_at": safe_isoformat(card.created_at),
             "updated_at": safe_isoformat(card.updated_at),
@@ -987,7 +1013,16 @@ class CardService:
                     lines = card.data_content.strip().split("\n")
                     return lines[0] if lines else None
             elif card.type == "image":
-                return card.image_url
+                if card.image_url:
+                    return card.image_url
+                if card.image_urls:
+                    try:
+                        parsed = json.loads(card.image_urls)
+                        if isinstance(parsed, list) and parsed:
+                            return parsed[0]
+                    except json.JSONDecodeError:
+                        pass
+                return None
             elif card.type == "api":
                 # API类型需要调用外部接口
                 return await self._call_card_api(card)

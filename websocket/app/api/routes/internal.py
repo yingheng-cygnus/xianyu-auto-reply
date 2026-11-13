@@ -1977,8 +1977,24 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
                 "data": None
             }
 
-        # image 类型预校验：必须有 image_url，否则直接失败
-        if card.type == 'image' and not card.image_url:
+        # 解析卡券配置的图片URL列表（优先取 image_urls JSON 数组，回退到旧单图字段 image_url）
+        import json as _json
+        card_image_urls: list[str] = []
+        has_multi_image_urls = False
+        if getattr(card, 'image_urls', None):
+            try:
+                parsed_urls = _json.loads(card.image_urls) if isinstance(card.image_urls, str) else card.image_urls
+                if isinstance(parsed_urls, list):
+                    card_image_urls = [str(u).strip() for u in parsed_urls if u and str(u).strip()]
+                    if card_image_urls:
+                        has_multi_image_urls = True
+            except Exception:
+                card_image_urls = []
+        if not card_image_urls and card.image_url and str(card.image_url).strip():
+            card_image_urls = [str(card.image_url).strip()]
+
+        # image 类型预校验：必须有 image_url 或 image_urls，否则直接失败
+        if card.type == 'image' and not card_image_urls:
             logger.error(f"【内部API】图片卡券缺少图片URL: card_id={request.card_id}")
             return {
                 "success": False,
@@ -1987,8 +2003,11 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
                 "data": None
             }
 
-        # 构建订单上下文（仅 text/data/api 文字渲染需要）
-        from app.services.xianyu.delivery_utils import process_delivery_content_with_description
+        # 构建订单上下文（文字渲染及图片卡券备注变量替换需要）
+        from app.services.xianyu.delivery_utils import (
+            process_delivery_content_with_description,
+            replace_order_context_variables,
+        )
         _order_context = {
             'order_id': request.order_no or '',
             'item_id': request.item_id or '',
@@ -2050,7 +2069,7 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
                     logger.warning(f"【内部API】{early_break_reason}")
                     break
             elif card.type == 'image':
-                content = card.image_url
+                content = card_image_urls[0] if len(card_image_urls) == 1 else "|".join(card_image_urls)
             elif card.type == 'api':
                 rule = {
                     'card_id': card.id,
@@ -2093,20 +2112,71 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
             send_ok = False
             try:
                 if card.type == 'image':
-                    logger.info(
-                        f"【内部API】发送图片消息 第 {idx}/{quantity}: {content}"
-                        if quantity > 1 else f"【内部API】发送图片消息: {content}"
-                    )
-                    await xianyu_live.send_image_msg(
-                        ws,
-                        request.chat_id,
-                        request.buyer_id,
-                        content,
-                        request.card_id
-                    )
-                    final_contents.append(f"[图片]{content}")
+                    sent_img_urls: list[str] = []
+                    for img_idx, img_url in enumerate(card_image_urls):
+                        logger.info(
+                            f"【内部API】发送图片消息 ({img_idx + 1}/{len(card_image_urls)}): {img_url}"
+                            if len(card_image_urls) > 1
+                            else f"【内部API】发送图片消息: {img_url}"
+                        )
+                        img_result = await xianyu_live.auto_delivery_handler._send_image_msg_with_retry(
+                            ws,
+                            request.chat_id,
+                            request.buyer_id,
+                            img_url,
+                            card_id=request.card_id,
+                            image_index=img_idx if has_multi_image_urls else None,
+                        )
+                        img_ok = isinstance(img_result, dict) and img_result.get("success", False)
+                        if not img_ok:
+                            img_err = (
+                                img_result.get("error_message", "图片发送失败")
+                                if isinstance(img_result, dict)
+                                else "图片发送失败"
+                            )
+                            raise RuntimeError(img_err)
+                        sent_img_urls.append(img_result.get("image_url") or img_url)
+
+                    # 图片类型卡券如果配置了备注（description），在图片发送后补充发送备注文字（与自动发货行为一致）
+                    desc_text = ""
+                    if card.description and card.description.strip():
+                        desc_text = replace_order_context_variables(card.description, _order_context)
+                        if desc_text:
+                            text_ok = await xianyu_live.auto_delivery_handler._send_text_with_separator(
+                                ws,
+                                request.chat_id,
+                                request.buyer_id,
+                                desc_text,
+                                send_results=send_results,
+                            )
+                            if not text_ok:
+                                raise RuntimeError("图片卡券备注文字发送失败")
+
+                    img_summary = "".join(f"[图片]{u}" for u in sent_img_urls)
+                    if desc_text:
+                        img_summary = f"{img_summary}\n{desc_text}"
+                    final_contents.append(img_summary)
                     send_ok = True
                 else:
+                    # 非 image 类型卡券若同时配置了附带图片，先发送附带图片（与自动发货一致）
+                    if card_image_urls:
+                        for img_idx, img_url in enumerate(card_image_urls):
+                            img_result = await xianyu_live.auto_delivery_handler._send_image_msg_with_retry(
+                                ws,
+                                request.chat_id,
+                                request.buyer_id,
+                                img_url,
+                                card_id=request.card_id,
+                                image_index=img_idx if has_multi_image_urls else None,
+                            )
+                            if not (isinstance(img_result, dict) and img_result.get("success", False)):
+                                img_err = (
+                                    img_result.get("error_message", "附带图片发送失败")
+                                    if isinstance(img_result, dict)
+                                    else "附带图片发送失败"
+                                )
+                                raise RuntimeError(img_err)
+
                     rendered = process_delivery_content_with_description(
                         content,
                         card.description or '',
@@ -2116,13 +2186,15 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
                         f"【内部API】发送文本消息 第 {idx}/{quantity}: {rendered[:50]}..."
                         if quantity > 1 else f"【内部API】发送文本消息: {rendered[:50]}..."
                     )
-                    await xianyu_live.auto_delivery_handler._send_text_with_separator(
+                    text_ok = await xianyu_live.auto_delivery_handler._send_text_with_separator(
                         ws,
                         request.chat_id,
                         request.buyer_id,
                         rendered,
                         send_results=send_results
                     )
+                    if not text_ok:
+                        raise RuntimeError("文本消息发送失败")
                     final_contents.append(rendered)
                     send_ok = True
             except Exception as send_err:
@@ -2501,8 +2573,9 @@ async def _deliver_order_impl(request: DeliverOrderRequest):
             "send_intercept_reason": intercept_written_msg,
         }
         if card.type == 'image':
-            # 兼容旧字段：单张图片场景仍返回 image_url
-            response_data["image_url"] = raw_contents[0] if raw_contents else card.image_url
+            # 兼容旧字段：单张图片场景仍返回 image_url，同时返回完整 image_urls 列表
+            response_data["image_url"] = card_image_urls[0] if card_image_urls else card.image_url
+            response_data["image_urls"] = card_image_urls
 
         return {
             "success": True,

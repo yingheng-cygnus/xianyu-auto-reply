@@ -607,13 +607,18 @@ class CardMatcher:
             except (json.JSONDecodeError, TypeError):
                 api_config = card.api_config
 
-        # 解析 image_urls JSON
+        # 解析 image_urls JSON（与单图字段 image_url 双向兜底）
         image_urls = None
         if card.image_urls:
             try:
-                image_urls = json.loads(card.image_urls)
+                parsed = json.loads(card.image_urls)
+                if isinstance(parsed, list):
+                    image_urls = [u for u in parsed if u]
             except (json.JSONDecodeError, TypeError):
                 image_urls = None
+        if not image_urls and card.image_url:
+            image_urls = [card.image_url]
+        primary_image_url = card.image_url or (image_urls[0] if image_urls else None)
 
         return {
             "id": card.id,
@@ -632,7 +637,7 @@ class CardMatcher:
             "api_config": api_config,
             "text_content": card.text_content,
             "data_content": card.data_content,
-            "image_url": card.image_url,
+            "image_url": primary_image_url,
             "image_urls": image_urls,
             "created_at": safe_isoformat(card.created_at),
             "updated_at": safe_isoformat(card.updated_at),

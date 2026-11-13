@@ -839,14 +839,14 @@ class DBManagerCompat:
     
     def update_card_image_url(self, card_id: int, image_url: str) -> bool:
         """更新卡券图片URL"""
-        async def _update():
-            async with async_session_maker() as session:
+        async def _update(session_maker):
+            async with session_maker() as session:
                 stmt = update(Card).where(Card.id == card_id).values(image_url=image_url)
                 result = await session.execute(stmt)
                 await session.commit()
                 return result.rowcount > 0
         try:
-            return self._run_async(_update())
+            return self._run_async(_update)
         except Exception as e:
             logger.error(f"更新卡券图片URL失败: {e}")
             return False
@@ -887,9 +887,12 @@ class DBManagerCompat:
                 # 更新指定索引的URL
                 urls_list[index] = cdn_url
                 
-                # 保存回数据库
+                # 保存回数据库（首张图片同步更新 image_url 字段，保持单图/多图字段一致）
                 new_urls_json = json.dumps(urls_list, ensure_ascii=False)
-                update_stmt = update(Card).where(Card.id == card_id).values(image_urls=new_urls_json)
+                values_to_update = {"image_urls": new_urls_json}
+                if index == 0:
+                    values_to_update["image_url"] = cdn_url
+                update_stmt = update(Card).where(Card.id == card_id).values(**values_to_update)
                 result = await session.execute(update_stmt)
                 await session.commit()
                 return result.rowcount > 0
