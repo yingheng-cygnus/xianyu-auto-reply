@@ -61,7 +61,7 @@ class AutoReplyChatMixin:
             
             # 2. 检查是否是系统消息（参照旧框架message_handler_core.py）
             # 这些系统消息不需要自动回复
-            if self.is_system_message_to_skip(send_message):
+            if self.is_system_message_to_skip(send_message, parsed_message.get("raw_message")):
                 logger.info(f"【{self.cookie_id}】系统消息跳过自动回复: {send_message}")
                 log_payload["process_status"] = "skipped"
                 log_payload["decision_reason"] = "system_message"

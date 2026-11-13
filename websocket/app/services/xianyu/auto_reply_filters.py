@@ -131,13 +131,36 @@ class AutoReplyFiltersMixin:
         async with self._processed_messages_lock:
             self._processed_messages.pop(dedup_key, None)
 
-    def is_system_message_to_skip(self, send_message: str) -> bool:
+    @staticmethod
+    def _is_platform_risk_notice_card(raw_message: Any) -> bool:
+        """识别闲鱼平台下发的风控/安全提示卡片（contentType=6 的 textCard 且关闭推送和未读计数）"""
+        if not isinstance(raw_message, dict):
+            return False
+        inner = raw_message.get("1")
+        if not isinstance(inner, dict):
+            return False
+        meta = inner.get("10")
+        if not isinstance(meta, dict):
+            return False
+        if meta.get("closePushReceiver") != "true" or meta.get("closeUnreadNumber") != "true":
+            return False
+        msg_6 = inner.get("6")
+        msg_6_3 = msg_6.get("3") if isinstance(msg_6, dict) else None
+        if isinstance(msg_6_3, dict) and str(msg_6_3.get("4", "")) == "6":
+            return True
+        ext_json = meta.get("extJson", "")
+        if isinstance(ext_json, str) and '"contentType":"6"' in ext_json.replace(" ", ""):
+            return True
+        return False
+
+    def is_system_message_to_skip(self, send_message: str, raw_message: Any = None) -> bool:
         """检查是否为需要跳过自动回复的系统消息
         
         参照旧框架message_handler_core.py的is_system_message_to_skip方法
         
         Args:
             send_message: 消息内容
+            raw_message: 原始解密消息（可选，用于识别平台下发的风控提示卡片）
             
         Returns:
             True表示应该跳过自动回复,False表示正常处理
@@ -153,6 +176,11 @@ class AutoReplyFiltersMixin:
             if skip_msg in send_message:
                 logger.info(f"【{self.cookie_id}】系统消息不处理自动回复(包含匹配): {send_message}")
                 return True
+
+        # 结构化识别平台风控/提示卡片（避免平台更换提示文案后误触发AI回复）
+        if not self.is_auto_delivery_trigger(send_message) and self._is_platform_risk_notice_card(raw_message):
+            logger.info(f"【{self.cookie_id}】系统风控/提示卡片不处理自动回复: {send_message}")
+            return True
         
         return False
 

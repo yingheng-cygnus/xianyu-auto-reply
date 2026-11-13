@@ -27,6 +27,7 @@ from common.db.session import async_session_maker
 from common.models.xy_account import XYAccount
 from common.models.ai_chat_message import AIChatMessage
 from common.models.auto_reply_message_log import XYAutoReplyMessageLog
+from common.models.xy_order import XYOrder
 from app.services.xianyu.resource_manager import pause_manager
 from common.services.ai_provider_service import (
     DEFAULT_AI_BASE_URL,
@@ -722,7 +723,88 @@ class AIReplyEngine:
         "有蚂蚁森林能量可领",
         "查看商品详情",
         "温馨提醒：商品信息近期有过变更",
+        "[请勿引导买家脱离优推抵扣商品进行交易]",
+        "[注意！小心假客服骗钱！]",
     }
+
+    async def _query_historical_trade_state(
+        self,
+        chat_id: str,
+        cookie_id: str,
+        db_session: AsyncSession,
+    ) -> tuple[bool, bool, bool, Optional[str]]:
+        """不受最近30条消息窗口限制，查询该会话历史上是否已下单/已自动发货。
+
+        返回 (has_ordered, has_delivered, has_pending_payment, pinned_delivery_line)。
+        """
+        has_ordered = False
+        has_delivered = False
+        has_pending_payment = False
+        pinned_delivery_line: Optional[str] = None
+
+        try:
+            delivery_stmt = (
+                select(
+                    XYAutoReplyMessageLog.source_message,
+                    XYAutoReplyMessageLog.reply_text,
+                )
+                .where(
+                    XYAutoReplyMessageLog.chat_id == chat_id,
+                    XYAutoReplyMessageLog.account_id == cookie_id,
+                    (
+                        (XYAutoReplyMessageLog.reply_strategy == "auto_delivery")
+                        | (XYAutoReplyMessageLog.decision_reason == "auto_delivery")
+                    ),
+                )
+                .order_by(XYAutoReplyMessageLog.id.desc())
+                .limit(1)
+            )
+            delivery_row = (await db_session.execute(delivery_stmt)).first()
+            if delivery_row:
+                has_ordered = True
+                has_delivered = True
+                rep_txt = (delivery_row.reply_text or "").strip()
+                src_txt = (delivery_row.source_message or "").strip()
+                summary = self._shorten_text(rep_txt, 160) if rep_txt else (src_txt or "已发送卡券/网盘内容")
+                pinned_delivery_line = f"assistant(系统已自动发货): {summary}"
+        except Exception as e:
+            logger.warning(f"【{cookie_id}】查询历史自动发货日志失败: {e}")
+
+        try:
+            order_stmt = (
+                select(
+                    XYOrder.order_no,
+                    XYOrder.status,
+                    XYOrder.delivery_content,
+                    XYOrder.card_only_delivered,
+                )
+                .where(
+                    XYOrder.chat_id == chat_id,
+                    XYOrder.account_id == cookie_id,
+                    XYOrder.status.in_(
+                        ("pending_payment", "pending_ship", "shipped", "completed")
+                    ),
+                )
+                .order_by(XYOrder.id.desc())
+                .limit(1)
+            )
+            order_row = (await db_session.execute(order_stmt)).first()
+            if order_row:
+                has_ordered = True
+                if order_row.status in ("shipped", "completed") or order_row.card_only_delivered:
+                    has_delivered = True
+                    if not pinned_delivery_line:
+                        content_preview = (
+                            self._shorten_text((order_row.delivery_content or "").strip(), 160)
+                            or f"订单 {order_row.order_no} 已发货"
+                        )
+                        pinned_delivery_line = f"assistant(系统已自动发货): {content_preview}"
+                elif order_row.status == "pending_payment" and not has_delivered:
+                    has_pending_payment = True
+        except Exception as e:
+            logger.warning(f"【{cookie_id}】查询会话历史订单状态失败: {e}")
+
+        return has_ordered, has_delivered, has_pending_payment, pinned_delivery_line
 
     async def _build_enriched_context(
         self,
@@ -732,7 +814,7 @@ class AIReplyEngine:
         fallback_context: List[Dict[str, str]],
         db_session: AsyncSession,
     ) -> tuple[str, str]:
-        """结合自动回复总日志表构建完整会话上下文，返回 (对话历史文本, 交易状态说明)"""
+        """结合自动回复总日志表与历史订单状态构建完整会话上下文，返回 (对话历史文本, 交易状态说明)"""
         try:
             stmt = (
                 select(
@@ -755,60 +837,71 @@ class AIReplyEngine:
             logger.warning(f"【{cookie_id}】查询扩展会话日志失败，回退至基础上下文: {e}")
             rows = []
 
-        if not rows:
-            lines = [f"{msg['role']}: {msg['content']}" for msg in fallback_context[-10:]]
-            return "\n".join(lines), "售前咨询阶段（尚未下单）"
+        (
+            hist_ordered,
+            hist_delivered,
+            hist_pending_payment,
+            hist_pinned_delivery_line,
+        ) = await self._query_historical_trade_state(chat_id, cookie_id, db_session)
 
         history_lines: List[str] = []
-        has_ordered = False
-        has_delivered = False
+        has_ordered = hist_ordered
+        has_delivered = hist_delivered
         pinned_delivery_line: Optional[str] = None
 
-        for sender_user_id, source_msg, decision_reason, reply_strategy, reply_text in rows:
-            src = (source_msg or "").strip()
-            rep = (reply_text or "").strip()
+        if not rows:
+            history_lines = [f"{msg['role']}: {msg['content']}" for msg in fallback_context[-10:]]
+        else:
+            for sender_user_id, source_msg, decision_reason, reply_strategy, reply_text in rows:
+                src = (source_msg or "").strip()
+                rep = (reply_text or "").strip()
 
-            if reply_strategy == "auto_delivery" or decision_reason == "auto_delivery":
-                has_ordered = True
-                has_delivered = True
-                summary = self._shorten_text(rep, 160) if rep else "已发送卡券/网盘内容"
-                pinned_delivery_line = f"assistant(系统已自动发货): {summary}"
-                history_lines.append(pinned_delivery_line)
-                continue
+                if reply_strategy == "auto_delivery" or decision_reason == "auto_delivery":
+                    has_ordered = True
+                    has_delivered = True
+                    summary = self._shorten_text(rep, 160) if rep else "已发送卡券/网盘内容"
+                    pinned_delivery_line = f"assistant(系统已自动发货): {summary}"
+                    history_lines.append(pinned_delivery_line)
+                    continue
 
-            if decision_reason == "self_message":
-                if src:
-                    history_lines.append(f"assistant(店主本人回复): {self._shorten_text(src, 160)}")
-                continue
+                if decision_reason == "self_message":
+                    if src:
+                        history_lines.append(f"assistant(店主本人回复): {self._shorten_text(src, 160)}")
+                    continue
 
-            if decision_reason in ("system_message", "auto_delivery_trigger"):
-                if src and src not in self._NOISY_SYSTEM_MESSAGES:
-                    if any(k in src for k in ("拍下", "付款", "发货", "收货")):
-                        has_ordered = True
-                    if "已发货" in src:
-                        has_delivered = True
-                    history_lines.append(f"system(交易状态): {src}")
-                continue
+                if decision_reason in ("system_message", "auto_delivery_trigger"):
+                    if src and src not in self._NOISY_SYSTEM_MESSAGES and "请勿引导" not in src:
+                        if any(k in src for k in ("拍下", "付款", "发货", "收货")):
+                            has_ordered = True
+                        if "已发货" in src:
+                            has_delivered = True
+                        history_lines.append(f"system(交易状态): {src}")
+                    continue
 
-            # 普通买家消息
-            if src:
-                history_lines.append(f"user: {self._shorten_text(src, 160)}")
-            if rep:
-                history_lines.append(f"assistant: {self._shorten_text(rep, 160)}")
+                # 普通买家消息（跳过历史误记的系统风控提示）
+                if src and "请勿引导" not in src:
+                    history_lines.append(f"user: {self._shorten_text(src, 160)}")
+                if rep:
+                    history_lines.append(f"assistant: {self._shorten_text(rep, 160)}")
 
-        # 追加当前刚收到的买家消息（当前消息在 handle_chat_message 结束时才写入日志表）
-        cur = (current_message or "").strip()
-        if cur:
-            last_user_line = f"user: {self._shorten_text(cur, 160)}"
-            if not history_lines or history_lines[-1] != last_user_line:
-                history_lines.append(last_user_line)
+            # 追加当前刚收到的买家消息（当前消息在 handle_chat_message 结束时才写入日志表）
+            cur = (current_message or "").strip()
+            if cur:
+                last_user_line = f"user: {self._shorten_text(cur, 160)}"
+                if not history_lines or history_lines[-1] != last_user_line:
+                    history_lines.append(last_user_line)
+
+        if not pinned_delivery_line and hist_pinned_delivery_line:
+            pinned_delivery_line = hist_pinned_delivery_line
 
         if has_delivered:
             trade_status = "买家已付款且系统已完成自动发货（当前为售后阶段，请直接解答问题，切勿再催促买家拍下或购买）"
+        elif has_ordered and hist_pending_payment:
+            trade_status = "买家已拍下待付款（已生成订单，请勿重复催拍，可提醒尽快付款）"
         elif has_ordered:
             trade_status = "买家已拍下/付款（请勿再催促买家拍下）"
         else:
-            trade_status = "售前咨询阶段"
+            trade_status = "售前咨询阶段（尚未下单）" if not rows else "售前咨询阶段"
 
         tail_lines = history_lines[-14:]
         if pinned_delivery_line and pinned_delivery_line not in tail_lines:
